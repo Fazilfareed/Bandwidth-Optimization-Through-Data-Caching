@@ -6,10 +6,26 @@ IFS=$'\n\t'
 # pkg-cache.sh
 # Server: apt-cacher-ng + verdaccio + devpi (docker compose)
 # Client: configure apt proxy + npm registry + pip index-url
-# Fixes:
+#
+# Fixes / Improvements:
 #  - Verdaccio storage permissions (EACCES -> 500) by chown to container uid/gid
 #  - APT 404 for security.ubuntu.com via proxy by forcing DIRECT for that host
 #  - grep + pipefail safety
+#  - Works even when "docker-compose" (v1) is installed instead of "docker compose" (v2)
+#  - If Docker socket permission issues happen in the current session, it uses:
+#       1) plain docker (if works)
+#       2) sg docker (no logout needed after adding to docker group)
+#       3) sudo docker (last resort)
+#
+# Cache Policies (Server):
+#  - Each repo cache directory capped to MAX_GB (default 3GB) per service:
+#      apt-cacher-ng, verdaccio, devpi
+#  - TTL: cached files older than TTL_DAYS (default 1 day) are removed
+#  - A systemd timer (if available) runs the policy every hour
+#
+# Override policy defaults via env:
+#   PKGCACHE_MAX_GB=3
+#   PKGCACHE_TTL_DAYS=1
 # -----------------------------
 
 SCRIPT_NAME="$(basename "$0")"
@@ -17,7 +33,6 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 STATE_DIR="${HOME}/.pkg-cache-state"
 
-# Put server files under a folder near the script by default
 SERVER_DIR="${PKGCACHE_SERVER_DIR:-$SCRIPT_DIR/pkg-cache}"
 SERVER_COMPOSE="${SERVER_DIR}/docker-compose.yml"
 SERVER_ENV_FILE="${SERVER_DIR}/.env"
@@ -29,7 +44,22 @@ APT_PROXY_FILE="/etc/apt/apt.conf.d/01-pkg-cache-proxy"
 APT_SECURITY_DIRECT_FILE="/etc/apt/apt.conf.d/02-pkg-cache-security-direct"
 CLIENT_STATE_FILE="${STATE_DIR}/client.env"
 
+# Policy defaults (override via env)
+MAX_GB="${PKGCACHE_MAX_GB:-3}"
+TTL_DAYS="${PKGCACHE_TTL_DAYS:-1}"
+
 ROLLBACK_CMDS=()
+
+# Docker execution mode for "docker" CLI: plain | sg | sudo
+DOCKER_MODE="plain"
+
+# Compose mode: plugin (`docker compose`) | legacy (`docker-compose`) | none
+COMPOSE_MODE="none"
+
+# For legacy docker-compose only:
+LEGACY_DOCKER_HOST=""
+COMPOSE_FORCE_SUDO="0"
+COMPOSE_FORCE_SG="0"
 
 log()  { echo -e "[$SCRIPT_NAME] $*"; }
 warn() { echo -e "[$SCRIPT_NAME] WARNING: $*" >&2; }
@@ -89,7 +119,6 @@ on_err() {
   exit "$exit_code"
 }
 
-# Health check helper (returns 0/1)
 wait_http() {
   local url="$1"
   local name="$2"
@@ -204,7 +233,6 @@ services:
              devpi-server --serverdir /data --host 0.0.0.0 --port 3141"
 YAML
 
-  # Verdaccio config (use "log", "logs" deprecated)
   cat >"$VERDACCIO_CONF" <<'YAML'
 storage: /verdaccio/storage
 
@@ -234,44 +262,9 @@ log:
 YAML
 }
 
-install_docker_if_needed() {
-  detect_debian || die "This script currently supports Debian/Ubuntu-based systems for automatic install."
-
-  if command -v docker >/dev/null 2>&1; then
-    if systemctl is-active --quiet docker 2>/dev/null; then
-      log "Docker already installed and running."
-      return 0
-    fi
-    warn "Docker installed but not running; starting docker..."
-    sudo_run systemctl enable --now docker
-    return 0
-  fi
-
-  log "Installing Docker (docker.io) and compose plugin..."
-  sudo_run apt-get update -y
-  sudo_run apt-get install -y docker.io docker-compose-plugin curl ca-certificates
-
-  push_rollback "sudo systemctl disable --now docker >/dev/null 2>&1 || true"
-  sudo_run systemctl enable --now docker
-}
-
-ensure_docker_group() {
-  if getent group docker >/dev/null 2>&1; then :; else sudo_run groupadd -f docker; fi
-
-  if getent group docker | grep -qE "(^|,)\s*${USER}\s*(,|$)"; then
-    log "User '$USER' is in docker group."
-    return 0
-  fi
-
-  sudo_run usermod -aG docker "$USER"
-  push_rollback "sudo gpasswd -d '$USER' docker >/dev/null 2>&1 || true"
-  warn "Added '$USER' to docker group."
-  warn "If docker permission issues happen, the script will fallback to sudo docker."
-}
-
-# --- Docker execution wrapper ---
-DOCKER_MODE="plain"  # plain | sg | sudo
-
+# -----------------------------
+# Docker CLI wrappers
+# -----------------------------
 docker_exec() {
   case "$DOCKER_MODE" in
     plain) run docker "$@" ;;
@@ -289,7 +282,6 @@ docker_exec() {
   esac
 }
 
-# Capture stdout from docker commands (no logging prefix)
 docker_capture() {
   case "$DOCKER_MODE" in
     plain) docker "$@" ;;
@@ -303,6 +295,208 @@ docker_capture() {
   esac
 }
 
+in_docker_group() {
+  getent group docker >/dev/null 2>&1 || return 1
+  getent group docker | grep -qE "(^|,)\s*${USER}\s*(,|$)"
+}
+
+get_docker_context_host() {
+  # Returns: unix:///var/run/docker.sock OR unix:///run/user/1000/docker.sock etc.
+  command -v python3 >/dev/null 2>&1 || return 1
+
+  local ctx json host
+  ctx="$(docker_capture context show 2>/dev/null | tr -d '\r' || true)"
+  [[ -n "$ctx" ]] || return 1
+
+  json="$(docker_capture context inspect "$ctx" 2>/dev/null || true)"
+  [[ -n "$json" ]] || return 1
+
+  host="$(
+    python3 -c 'import json,sys
+d=json.load(sys.stdin)
+if isinstance(d,list) and d:
+  print((d[0].get("Endpoints",{}).get("docker",{}) or {}).get("Host",""))
+' <<<"$json" 2>/dev/null || true
+  )"
+
+  [[ -n "${host:-}" ]] || return 1
+  printf '%s' "$host"
+}
+
+unix_host_socket_path() {
+  local host="$1"
+  if [[ "$host" == unix://* ]]; then
+    printf '%s' "${host#unix://}"
+    return 0
+  fi
+  return 1
+}
+
+# -----------------------------
+# Compose wrappers
+# -----------------------------
+detect_compose_mode() {
+  if docker_capture compose version >/dev/null 2>&1; then
+    COMPOSE_MODE="plugin"
+    return 0
+  fi
+  if command -v docker-compose >/dev/null 2>&1; then
+    COMPOSE_MODE="legacy"
+    return 0
+  fi
+  COMPOSE_MODE="none"
+  return 1
+}
+
+try_install_compose_v2() {
+  # Best-effort: try to install compose v2 package if available (do not fail hard).
+  detect_debian || return 0
+  command -v apt-get >/dev/null 2>&1 || return 0
+  command -v apt-cache >/dev/null 2>&1 || return 0
+
+  sudo_run apt-get update -y >/dev/null 2>&1 || true
+
+  # Different distros/repos expose different package names.
+  for p in docker-compose-v2 docker-compose-plugin docker-compose; do
+    if apt-cache show "$p" >/dev/null 2>&1; then
+      sudo_run apt-get install -y "$p" >/dev/null 2>&1 || true
+    fi
+  done
+}
+
+init_legacy_compose_env() {
+  LEGACY_DOCKER_HOST=""
+  COMPOSE_FORCE_SUDO="0"
+  COMPOSE_FORCE_SG="0"
+
+  local host sock
+  host="$(get_docker_context_host 2>/dev/null || true)"
+  if [[ -n "${host:-}" ]]; then
+    LEGACY_DOCKER_HOST="$host"
+    log "Legacy docker-compose: using DOCKER_HOST from context: $LEGACY_DOCKER_HOST"
+  fi
+
+  if [[ -n "${LEGACY_DOCKER_HOST:-}" ]]; then
+    sock="$(unix_host_socket_path "$LEGACY_DOCKER_HOST" || true)"
+  else
+    sock="/var/run/docker.sock"
+    LEGACY_DOCKER_HOST="unix:///var/run/docker.sock"
+  fi
+
+  if [[ -n "${sock:-}" && -S "$sock" ]]; then
+    if [[ -r "$sock" && -w "$sock" ]]; then
+      return 0
+    fi
+
+    if command -v sg >/dev/null 2>&1 && in_docker_group; then
+      COMPOSE_FORCE_SG="1"
+      warn "Legacy docker-compose can't access docker socket in this session; will run via: sg docker (no logout needed)."
+      return 0
+    fi
+
+    COMPOSE_FORCE_SUDO="1"
+    warn "Legacy docker-compose can't access docker socket; will run docker-compose with sudo."
+  fi
+}
+
+legacy_compose_exec() {
+  local -a args=("$@")
+  local quoted_host
+  quoted_host="$(printf '%q' "$LEGACY_DOCKER_HOST")"
+
+  if [[ "$COMPOSE_FORCE_SUDO" == "1" ]]; then
+    log "→ (sudo) env DOCKER_HOST=$LEGACY_DOCKER_HOST docker-compose $(cmd_str "${args[@]}")"
+    sudo_run env DOCKER_HOST="$LEGACY_DOCKER_HOST" docker-compose "${args[@]}"
+    return $?
+  fi
+
+  if [[ "$COMPOSE_FORCE_SG" == "1" ]]; then
+    need_cmd sg
+    local cmd
+    cmd="DOCKER_HOST=$quoted_host $(cmd_str docker-compose "${args[@]}")"
+    log "→ (sg docker) $cmd"
+    sg docker -c "$cmd"
+    return $?
+  fi
+
+  run env DOCKER_HOST="$LEGACY_DOCKER_HOST" docker-compose "${args[@]}"
+}
+
+legacy_compose_capture() {
+  local -a args=("$@")
+  local quoted_host
+  quoted_host="$(printf '%q' "$LEGACY_DOCKER_HOST")"
+
+  if [[ "$COMPOSE_FORCE_SUDO" == "1" ]]; then
+    sudo_run env DOCKER_HOST="$LEGACY_DOCKER_HOST" docker-compose "${args[@]}"
+    return $?
+  fi
+
+  if [[ "$COMPOSE_FORCE_SG" == "1" ]]; then
+    need_cmd sg
+    local cmd
+    cmd="DOCKER_HOST=$quoted_host $(cmd_str docker-compose "${args[@]}")"
+    sg docker -c "$cmd"
+    return $?
+  fi
+
+  env DOCKER_HOST="$LEGACY_DOCKER_HOST" docker-compose "${args[@]}"
+}
+
+compose_exec() {
+  case "$COMPOSE_MODE" in
+    plugin) docker_exec compose "$@" ;;
+    legacy) legacy_compose_exec "$@" ;;
+    *) die "Compose is not available (install docker-compose-v2 or docker-compose)." ;;
+  esac
+}
+
+compose_capture() {
+  case "$COMPOSE_MODE" in
+    plugin) docker_capture compose "$@" ;;
+    legacy) legacy_compose_capture "$@" ;;
+    *) return 1 ;;
+  esac
+}
+
+# -----------------------------
+# Install / Init
+# -----------------------------
+install_docker_if_needed() {
+  detect_debian || die "This script currently supports Debian/Ubuntu-based systems for automatic install."
+
+  if command -v docker >/dev/null 2>&1; then
+    if systemctl is-active --quiet docker 2>/dev/null; then
+      log "Docker already installed and running."
+      return 0
+    fi
+    warn "Docker installed but not running; starting docker..."
+    sudo_run systemctl enable --now docker
+    return 0
+  fi
+
+  log "Installing Docker (docker.io) ..."
+  sudo_run apt-get update -y
+  sudo_run apt-get install -y docker.io curl ca-certificates
+
+  push_rollback "sudo systemctl disable --now docker >/dev/null 2>&1 || true"
+  sudo_run systemctl enable --now docker
+}
+
+ensure_docker_group() {
+  if getent group docker >/dev/null 2>&1; then :; else sudo_run groupadd -f docker; fi
+
+  if in_docker_group; then
+    log "User '$USER' is in docker group."
+    return 0
+  fi
+
+  sudo_run usermod -aG docker "$USER"
+  push_rollback "sudo gpasswd -d '$USER' docker >/dev/null 2>&1 || true"
+  warn "Added '$USER' to docker group."
+  warn "If permission issues happen in this session, the script will use 'sg docker' or sudo automatically."
+}
+
 init_docker_runner() {
   need_cmd docker
 
@@ -311,29 +505,45 @@ init_docker_runner() {
     sudo_run systemctl restart docker >/dev/null 2>&1 || true
   fi
 
-  if docker info >/dev/null 2>&1; then
+  # Prefer a test that matches real usage (talking to docker.sock)
+  if docker ps >/dev/null 2>&1; then
     DOCKER_MODE="plain"
-    log "Docker access: OK (plain)."
-    return 0
-  fi
-
-  if command -v sg >/dev/null 2>&1; then
-    if getent group docker | grep -qE "(^|,)\s*${USER}\s*(,|$)"; then
-      if sg docker -c "docker info" >/dev/null 2>&1; then
+  else
+    if command -v sg >/dev/null 2>&1; then
+      if sg docker -c "docker ps" >/dev/null 2>&1; then
         DOCKER_MODE="sg"
-        log "Docker access: OK (sg docker)."
-        return 0
       fi
     fi
   fi
 
-  if sudo_run docker info >/dev/null 2>&1; then
-    DOCKER_MODE="sudo"
-    warn "Docker access requires sudo on this machine/session."
-    return 0
+  if [[ "$DOCKER_MODE" != "plain" && "$DOCKER_MODE" != "sg" ]]; then
+    if sudo_run docker ps >/dev/null 2>&1; then
+      DOCKER_MODE="sudo"
+      warn "Docker access requires sudo on this machine/session."
+    else
+      die "Docker daemon is not accessible. Check: sudo systemctl status docker"
+    fi
   fi
 
-  die "Docker daemon is not accessible. Check: sudo systemctl status docker"
+  log "Docker access: OK ($DOCKER_MODE)."
+
+  detect_compose_mode || true
+
+  if [[ "$COMPOSE_MODE" == "legacy" ]]; then
+    warn "Only legacy docker-compose detected. Trying to install Docker Compose v2 (preferred)..."
+    try_install_compose_v2
+    detect_compose_mode || true
+  fi
+
+  if [[ "$COMPOSE_MODE" == "legacy" ]]; then
+    init_legacy_compose_env
+  fi
+
+  if [[ "$COMPOSE_MODE" == "none" ]]; then
+    die "Docker Compose not found. Install one of these:\n  - docker-compose-v2 (preferred)\n  - docker-compose (legacy)"
+  fi
+
+  log "Compose mode: $COMPOSE_MODE"
 }
 
 write_env_file() {
@@ -346,17 +556,16 @@ EOF
 }
 
 server_up() {
-  docker_exec compose version >/dev/null 2>&1 || die "Docker Compose plugin not available."
-  (cd "$SERVER_DIR" && docker_exec compose up -d)
-  push_rollback "(cd '$SERVER_DIR' && sudo docker compose down -v >/dev/null 2>&1 || true)"
+  compose_capture version >/dev/null 2>&1 || die "Docker Compose is not available."
+  (cd "$SERVER_DIR" && compose_exec up -d)
+
+  push_rollback "(cd '$SERVER_DIR' && (sudo docker compose down -v 2>/dev/null || sudo docker-compose down -v 2>/dev/null || docker compose down -v 2>/dev/null || docker-compose down -v 2>/dev/null) || true)"
 }
 
-# Fix Verdaccio EACCES by matching host dir ownership to container uid/gid
 fix_verdaccio_permissions() {
   local host_dir="$DATA_DIR/verdaccio"
   mkdir -p "$host_dir"
 
-  # Try to read uid/gid from container
   local uid gid
   uid="$(docker_capture exec verdaccio sh -lc 'id -u' 2>/dev/null | tr -d '\r' || true)"
   gid="$(docker_capture exec verdaccio sh -lc 'id -g' 2>/dev/null | tr -d '\r' || true)"
@@ -366,11 +575,8 @@ fix_verdaccio_permissions() {
     uid="10001"; gid="10001"
   fi
 
-  # If owned by root (common when compose ran with sudo), fix it
   sudo_run chown -R "${uid}:${gid}" "$host_dir" || true
-
-  # Restart verdaccio so it can write immediately
-  (cd "$SERVER_DIR" && docker_exec compose restart verdaccio) || true
+  (cd "$SERVER_DIR" && compose_exec restart verdaccio) || true
 }
 
 server_health_checks() {
@@ -389,6 +595,348 @@ server_health_checks() {
   fi
 }
 
+# -----------------------------
+# Cache Policy Enforcement
+# -----------------------------
+policy_max_bytes() {
+  # MAX_GB can be int like 3
+  local gb="${1:-3}"
+  if [[ ! "$gb" =~ ^[0-9]+$ ]]; then
+    gb="3"
+  fi
+  echo $((gb * 1024 * 1024 * 1024))
+}
+
+dir_size_bytes() {
+  local dir="$1"
+  if command -v du >/dev/null 2>&1; then
+    # GNU du supports -sb
+    if du -sb "$dir" >/dev/null 2>&1; then
+      du -sb "$dir" 2>/dev/null | awk '{print $1}'
+      return 0
+    fi
+    # Fallback: du -sk
+    du -sk "$dir" 2>/dev/null | awk '{print $1 * 1024}'
+    return 0
+  fi
+  echo 0
+}
+
+prune_dir_ttl() {
+  local dir="$1"
+  local ttl_days="$2"
+  shift 2
+  local -a excludes=("$@")
+
+  [[ -d "$dir" ]] || return 0
+
+  # Build find expression: ! -name x ! -path y ...
+  local -a expr=()
+  for ex in "${excludes[@]}"; do
+    if [[ "$ex" == */* ]]; then
+      expr+=(! -path "$ex")
+    else
+      expr+=(! -name "$ex")
+    fi
+  done
+
+  # Remove files not accessed in ttl_days (best-effort; relies on atime/relatime)
+  # If atime isn't helpful, mtime still changes on writes, and the size cap handles the rest.
+  find "$dir" -type f -atime "+${ttl_days}" "${expr[@]}" -print0 2>/dev/null \
+    | xargs -0r rm -f -- 2>/dev/null || true
+
+  # Clean empty dirs
+  find "$dir" -type d -empty -delete 2>/dev/null || true
+}
+
+prune_dir_size_cap() {
+  local dir="$1"
+  local max_bytes="$2"
+  shift 2
+  local -a excludes=("$@")
+
+  [[ -d "$dir" ]] || return 0
+
+  local current
+  current="$(dir_size_bytes "$dir")"
+  [[ -n "${current:-}" ]] || current=0
+
+  if (( current <= max_bytes )); then
+    return 0
+  fi
+
+  warn "Policy: '$dir' is $(printf '%.2f' "$(awk "BEGIN{print $current/1024/1024/1024}")")GB, capping to $(printf '%.2f' "$(awk "BEGIN{print $max_bytes/1024/1024/1024}")")GB"
+
+  # Build find excludes
+  local -a expr=()
+  for ex in "${excludes[@]}"; do
+    if [[ "$ex" == */* ]]; then
+      expr+=(! -path "$ex")
+    else
+      expr+=(! -name "$ex")
+    fi
+  done
+
+  need_cmd find
+  need_cmd sort
+
+  # Delete oldest files by mtime until below cap
+  while (( current > max_bytes )); do
+    local oldest
+    oldest="$(
+      find "$dir" -type f "${expr[@]}" -printf '%T@ %p\n' 2>/dev/null \
+        | sort -n \
+        | head -n 200 \
+        | awk '{print $2}' \
+        | head -n 1
+    )"
+
+    if [[ -z "${oldest:-}" ]]; then
+      warn "Policy: unable to find deletable files in '$dir' (excludes too strict?)"
+      break
+    fi
+
+    rm -f -- "$oldest" 2>/dev/null || true
+    current="$(dir_size_bytes "$dir")"
+    [[ -n "${current:-}" ]] || current=0
+  done
+
+  find "$dir" -type d -empty -delete 2>/dev/null || true
+}
+
+policy_run_server() {
+  local max_bytes ttl_days
+  max_bytes="$(policy_max_bytes "$MAX_GB")"
+  ttl_days="$TTL_DAYS"
+
+  log "Running cache policy: MAX_GB=$MAX_GB (per service), TTL_DAYS=$TTL_DAYS"
+
+  # apt-cacher-ng (safe to prune old .deb and metadata files)
+  prune_dir_ttl "$DATA_DIR/apt-cacher-ng" "$ttl_days"
+  prune_dir_size_cap "$DATA_DIR/apt-cacher-ng" "$max_bytes"
+
+  # verdaccio storage (exclude auth file; keep it regardless of TTL)
+  prune_dir_ttl "$DATA_DIR/verdaccio" "$ttl_days" "htpasswd"
+  prune_dir_size_cap "$DATA_DIR/verdaccio" "$max_bytes" "htpasswd"
+
+  # devpi serverdir: prefer pruning only package file areas if present
+  local devpi_root="$DATA_DIR/devpi"
+  if [[ -d "$devpi_root/+files" || -d "$devpi_root/+docs" ]]; then
+    [[ -d "$devpi_root/+files" ]] && prune_dir_ttl "$devpi_root/+files" "$ttl_days"
+    [[ -d "$devpi_root/+docs" ]]  && prune_dir_ttl "$devpi_root/+docs" "$ttl_days"
+    [[ -d "$devpi_root/+files" ]] && prune_dir_size_cap "$devpi_root/+files" "$max_bytes"
+    [[ -d "$devpi_root/+docs" ]]  && prune_dir_size_cap "$devpi_root/+docs" "$max_bytes"
+  else
+    # Fallback (best-effort): do NOT delete devpi init marker or typical sqlite files
+    prune_dir_ttl "$devpi_root" "$ttl_days" ".inited" "*.sqlite" "*.db"
+    prune_dir_size_cap "$devpi_root" "$max_bytes" ".inited" "*.sqlite" "*.db"
+  fi
+
+  log "Policy run complete."
+}
+
+write_policy_script() {
+  local policy_script="$SERVER_DIR/pkg-cache-policy.sh"
+  cat >"$policy_script" <<'EOF'
+#!/usr/bin/env bash
+set -euo pipefail
+IFS=$'\n\t'
+
+# Standalone policy runner (written by pkg-cache.sh)
+# Uses:
+#   PKGCACHE_MAX_GB (default 3)
+#   PKGCACHE_TTL_DAYS (default 1)
+#   PKGCACHE_SERVER_DIR (optional)
+#   DATA_DIR resolved from SERVER_DIR
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+SERVER_DIR="${PKGCACHE_SERVER_DIR:-$SCRIPT_DIR}"
+DATA_DIR="${SERVER_DIR}/data"
+
+MAX_GB="${PKGCACHE_MAX_GB:-3}"
+TTL_DAYS="${PKGCACHE_TTL_DAYS:-1}"
+
+log()  { echo -e "[pkg-cache-policy] $*"; }
+warn() { echo -e "[pkg-cache-policy] WARNING: $*" >&2; }
+
+policy_max_bytes() {
+  local gb="${1:-3}"
+  if [[ ! "$gb" =~ ^[0-9]+$ ]]; then gb="3"; fi
+  echo $((gb * 1024 * 1024 * 1024))
+}
+
+dir_size_bytes() {
+  local dir="$1"
+  if du -sb "$dir" >/dev/null 2>&1; then
+    du -sb "$dir" 2>/dev/null | awk '{print $1}'
+    return 0
+  fi
+  du -sk "$dir" 2>/dev/null | awk '{print $1 * 1024}'
+}
+
+prune_dir_ttl() {
+  local dir="$1"
+  local ttl_days="$2"
+  shift 2
+  local -a excludes=("$@")
+
+  [[ -d "$dir" ]] || return 0
+
+  local -a expr=()
+  for ex in "${excludes[@]}"; do
+    if [[ "$ex" == */* ]]; then
+      expr+=(! -path "$ex")
+    else
+      expr+=(! -name "$ex")
+    fi
+  done
+
+  find "$dir" -type f -atime "+${ttl_days}" "${expr[@]}" -print0 2>/dev/null \
+    | xargs -0r rm -f -- 2>/dev/null || true
+  find "$dir" -type d -empty -delete 2>/dev/null || true
+}
+
+prune_dir_size_cap() {
+  local dir="$1"
+  local max_bytes="$2"
+  shift 2
+  local -a excludes=("$@")
+
+  [[ -d "$dir" ]] || return 0
+
+  local current
+  current="$(dir_size_bytes "$dir")"
+  [[ -n "${current:-}" ]] || current=0
+
+  if (( current <= max_bytes )); then
+    return 0
+  fi
+
+  warn "Policy: '$dir' is $(awk "BEGIN{print $current/1024/1024/1024}")GB, capping to $(awk "BEGIN{print $max_bytes/1024/1024/1024}")GB"
+
+  local -a expr=()
+  for ex in "${excludes[@]}"; do
+    if [[ "$ex" == */* ]]; then
+      expr+=(! -path "$ex")
+    else
+      expr+=(! -name "$ex")
+    fi
+  done
+
+  while (( current > max_bytes )); do
+    local oldest
+    oldest="$(
+      find "$dir" -type f "${expr[@]}" -printf '%T@ %p\n' 2>/dev/null \
+        | sort -n \
+        | head -n 200 \
+        | awk '{print $2}' \
+        | head -n 1
+    )"
+    [[ -n "${oldest:-}" ]] || break
+    rm -f -- "$oldest" 2>/dev/null || true
+    current="$(dir_size_bytes "$dir")"
+    [[ -n "${current:-}" ]] || current=0
+  done
+
+  find "$dir" -type d -empty -delete 2>/dev/null || true
+}
+
+main() {
+  local max_bytes ttl_days
+  max_bytes="$(policy_max_bytes "$MAX_GB")"
+  ttl_days="$TTL_DAYS"
+
+  log "Running cache policy: MAX_GB=$MAX_GB (per service), TTL_DAYS=$TTL_DAYS"
+  prune_dir_ttl "$DATA_DIR/apt-cacher-ng" "$ttl_days"
+  prune_dir_size_cap "$DATA_DIR/apt-cacher-ng" "$max_bytes"
+
+  prune_dir_ttl "$DATA_DIR/verdaccio" "$ttl_days" "htpasswd"
+  prune_dir_size_cap "$DATA_DIR/verdaccio" "$max_bytes" "htpasswd"
+
+  local devpi_root="$DATA_DIR/devpi"
+  if [[ -d "$devpi_root/+files" || -d "$devpi_root/+docs" ]]; then
+    [[ -d "$devpi_root/+files" ]] && prune_dir_ttl "$devpi_root/+files" "$ttl_days"
+    [[ -d "$devpi_root/+docs" ]]  && prune_dir_ttl "$devpi_root/+docs" "$ttl_days"
+    [[ -d "$devpi_root/+files" ]] && prune_dir_size_cap "$devpi_root/+files" "$max_bytes"
+    [[ -d "$devpi_root/+docs" ]]  && prune_dir_size_cap "$devpi_root/+docs" "$max_bytes"
+  else
+    prune_dir_ttl "$devpi_root" "$ttl_days" ".inited" "*.sqlite" "*.db"
+    prune_dir_size_cap "$devpi_root" "$max_bytes" ".inited" "*.sqlite" "*.db"
+  fi
+
+  log "Policy run complete."
+}
+
+main "$@"
+EOF
+  chmod +x "$policy_script"
+}
+
+install_policy_timer() {
+  # Install a systemd timer if systemd exists
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "systemctl not found; skipping policy timer install (you can run: $SCRIPT_NAME server policy-run)"
+    return 0
+  fi
+
+  # Some environments have systemctl but no systemd running (containers)
+  if ! systemctl list-units >/dev/null 2>&1; then
+    warn "systemd not available/running; skipping policy timer install (you can run: $SCRIPT_NAME server policy-run)"
+    return 0
+  fi
+
+  sudo_check
+
+  local svc="/etc/systemd/system/pkg-cache-policy.service"
+  local tmr="/etc/systemd/system/pkg-cache-policy.timer"
+
+  sudo_run tee "$svc" >/dev/null <<EOF
+[Unit]
+Description=pkg-cache policy enforcement (TTL + size caps)
+
+[Service]
+Type=oneshot
+Environment=PKGCACHE_SERVER_DIR=${SERVER_DIR}
+Environment=PKGCACHE_MAX_GB=${MAX_GB}
+Environment=PKGCACHE_TTL_DAYS=${TTL_DAYS}
+ExecStart=/bin/bash ${SERVER_DIR}/pkg-cache-policy.sh
+EOF
+
+  sudo_run tee "$tmr" >/dev/null <<'EOF'
+[Unit]
+Description=Run pkg-cache policy every hour
+
+[Timer]
+OnBootSec=5m
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
+  sudo_run systemctl daemon-reload
+  sudo_run systemctl enable --now pkg-cache-policy.timer >/dev/null 2>&1 || true
+
+  log "Policy timer installed: runs every hour (systemd timer pkg-cache-policy.timer)"
+}
+
+uninstall_policy_timer() {
+  if ! command -v systemctl >/dev/null 2>&1; then
+    warn "systemctl not found; nothing to uninstall."
+    return 0
+  fi
+
+  sudo_check
+  sudo_run systemctl disable --now pkg-cache-policy.timer >/dev/null 2>&1 || true
+  sudo_run rm -f /etc/systemd/system/pkg-cache-policy.timer /etc/systemd/system/pkg-cache-policy.service
+  sudo_run systemctl daemon-reload
+  log "Policy timer uninstalled."
+}
+
+# -----------------------------
+# Server actions
+# -----------------------------
 server_install() {
   trap 'on_err $LINENO "$BASH_COMMAND"' ERR
   ensure_dirs
@@ -414,6 +962,13 @@ server_install() {
 
   server_up
   fix_verdaccio_permissions
+
+  # Write + install cache policy
+  write_policy_script
+  install_policy_timer
+  # Run once immediately
+  policy_run_server || true
+
   server_health_checks
 
   local ip
@@ -425,6 +980,8 @@ server_install() {
   log "Verdaccio (npm):   http://${ip:-SERVER_IP}:4873/"
   log "devpi (pip):       http://${ip:-SERVER_IP}:3141/"
   log ""
+  log "Policy defaults: MAX_GB=${MAX_GB}GB per service, TTL_DAYS=${TTL_DAYS}"
+  log "Override: PKGCACHE_MAX_GB=... PKGCACHE_TTL_DAYS=..."
   log "Note: APT caching works best when client APT sources use HTTP (not HTTPS)."
   trap - ERR
 }
@@ -434,7 +991,7 @@ server_reset() {
   if [[ -d "$SERVER_DIR" ]]; then
     if command -v docker >/dev/null 2>&1; then
       init_docker_runner || true
-      (cd "$SERVER_DIR" && docker_exec compose down -v) || true
+      (cd "$SERVER_DIR" && compose_exec down -v) || true
     fi
     rm -rf "$SERVER_DIR"
   fi
@@ -442,6 +999,19 @@ server_reset() {
   log "✅ Server reset done."
 }
 
+server_policy_run() {
+  ensure_dirs
+  write_policy_script
+  policy_run_server
+}
+
+server_policy_uninstall() {
+  uninstall_policy_timer
+}
+
+# -----------------------------
+# Client actions
+# -----------------------------
 client_install() {
   local server_host="${1:-}"
   [[ -n "$server_host" ]] || die "client install requires SERVER_IP/host. Example: $SCRIPT_NAME client install 192.168.1.50"
@@ -582,13 +1152,19 @@ client_reset() {
 usage() {
   cat <<EOF
 Usage:
-  # On your laptop (server)
+  # Server (host machine)
   $SCRIPT_NAME server install
   $SCRIPT_NAME server reset
+  $SCRIPT_NAME server policy-run
+  $SCRIPT_NAME server policy-uninstall
 
-  # On friends' laptops (clients)
+  # Client (other machines)
   $SCRIPT_NAME client install <SERVER_IP_or_host>
   $SCRIPT_NAME client reset
+
+Policy defaults (server):
+  MAX per service: ${MAX_GB}GB   (override: PKGCACHE_MAX_GB=...)
+  TTL:             ${TTL_DAYS} day(s) (override: PKGCACHE_TTL_DAYS=...)
 
 Notes:
   - APT caching with apt-cacher-ng works best when APT sources use HTTP (not HTTPS).
@@ -603,10 +1179,12 @@ main() {
   local action="${2:-}"
 
   case "$role:$action" in
-    server:install) server_install ;;
-    server:reset)   server_reset ;;
-    client:install) client_install "${3:-}" ;;
-    client:reset)   client_reset ;;
+    server:install)          server_install ;;
+    server:reset)            server_reset ;;
+    server:policy-run)       server_policy_run ;;
+    server:policy-uninstall) server_policy_uninstall ;;
+    client:install)          client_install "${3:-}" ;;
+    client:reset)            client_reset ;;
     *) usage; exit 1 ;;
   esac
 }
