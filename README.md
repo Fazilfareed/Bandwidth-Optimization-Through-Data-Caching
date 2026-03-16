@@ -310,8 +310,8 @@ unified-package-caching-system/
 | Item        | Details                                           |
 | ----------- | ------------------------------------------------- |
 | Name        | Project Team / Repository Maintainer              |
-| Email       | your-team-email@example.com                       |
-| Institution | Add your institution name before final submission |
+| Email       | fahimabdullah528@gmail.com                        |
+| Institution | University of Jaffna                              |
 
 ## Licence
 
