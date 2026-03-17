@@ -129,10 +129,10 @@ class InstallerApp(tk.Tk):
             text="Reset",
             style="Neutral.TButton",
             width=22,
-            command=lambda: self.go_ip("reset")
+            command=lambda: self.run_action("reset")
         )
         b2.grid(row=1, column=0, pady=10)
-
+        #self.run_action(self.current_action, ip if ip else None)
         b3 = ttk.Button(
             btn_frame,
             text="Status",
